@@ -40,7 +40,7 @@ Use it when you need to:
 Template source:
 
 ```text
-git@four.github.com:muchen-ai/muchen-plateform.git
+git@github.com:muchen-ai/muchen-plateform.git
 ```
 
 Skill source:

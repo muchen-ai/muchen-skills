@@ -4,7 +4,7 @@ Use these facts as the default contract for `muchen` template projects.
 
 ## Source
 
-- Template repository: `git@four.github.com:muchen-ai/muchen-plateform.git`
+- Template repository: `git@github.com:muchen-ai/muchen-plateform.git`
 - Default template ref: `template-v1.0.0`
 - The skill repository must not vendor or copy the template source.
 

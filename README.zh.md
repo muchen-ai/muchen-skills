@@ -40,7 +40,7 @@ npx skills add muchen-ai/muchen-skills
 模板来源：
 
 ```text
-git@four.github.com:muchen-ai/muchen-plateform.git
+git@github.com:muchen-ai/muchen-plateform.git
 ```
 
 Skill 目录：

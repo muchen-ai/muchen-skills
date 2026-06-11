@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REMOTE="git@four.github.com:muchen-ai/muchen-plateform.git"
+REMOTE="git@github.com:muchen-ai/muchen-plateform.git"
 TEMPLATE_REF="template-v1.0.0"
 KEEP_GIT=0
 
@@ -12,7 +12,7 @@ Usage:
 
 Defaults:
   --template-ref template-v1.0.0
-  --remote git@four.github.com:muchen-ai/muchen-plateform.git
+  --remote git@github.com:muchen-ai/muchen-plateform.git
 
 The target directory must not exist or must be empty. By default, template Git history is removed
 after cloning so the new business project can use its own repository.
