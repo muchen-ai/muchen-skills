@@ -1,0 +1,9 @@
+{
+  "name": "muchen-skills",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "validate": "sh scripts/validate-skills.sh",
+    "audit:template": "skills/muchen-xiaochengxu-develop/scripts/audit_muchen_project.sh /Users/apple/develop/myworkspace/2026/项目/muchen-plateform-template"
+  }
+}

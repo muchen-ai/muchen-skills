@@ -1,0 +1,22 @@
+{
+  "name": "muchen-skills",
+  "owner": {
+    "name": "muchen-ai",
+    "email": ""
+  },
+  "metadata": {
+    "description": "Skills for developing muchen mini program full-stack projects",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "muchen-skills",
+      "description": "muchen mini program template initialization, full-stack development, Docker verification, and cleanup workflows",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/muchen-xiaochengxu-develop"
+      ]
+    }
+  ]
+}

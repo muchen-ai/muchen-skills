@@ -1,0 +1,14 @@
+.DS_Store
+**/.DS_Store
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+target/
+**/target/
+output/
+**/output/
+.pnpm-store/
+**/.pnpm-store/
+*.log
+*.zip
