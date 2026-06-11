@@ -1,0 +1,4 @@
+interface:
+  display_name: "沐辰小程序开发"
+  short_description: "基于 muchen 模板创建、开发和联调小程序全栈项目"
+  default_prompt: "Use $muchen-xiaochengxu-develop to create a new muchen mini program project and guide full-stack development."
