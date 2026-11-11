@@ -1,0 +1,106 @@
+#!/bin/bash
+set -euo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+export LC_ALL=C
+umask 077
+
+state=/etc/muchen-safe-ai-sh
+libexec=/usr/local/libexec/muchen-safe-ai-sh
+issuer=/usr/local/bin/ops-access-root
+lock=/run/muchen-safe-ai-sh-install.lock
+bundle=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+
+fail() { printf 'install-root: %s\n' "$*" >&2; exit 1; }
+exists() { [[ -e $1 || -L $1 ]]; }
+protected() {
+    local permissions
+    [[ ! -L $1 && -O $1 ]] || return 1
+    permissions=$(stat -c '%a' -- "$1") || return 1
+    (( (8#$permissions & 0022) == 0 ))
+}
+key_identity() {
+    local -a lines
+    local type material
+    mapfile -t lines < "$1" || return 1
+    (( ${#lines[@]} == 1 )) || return 1
+    read -r type material _ <<< "${lines[0]}"
+    [[ $type == ssh-ed25519 && $material =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || return 1
+    printf '%s %s\n' "$type" "$material"
+}
+
+(( $# == 0 )) || fail 'usage: sudo ./install-root'
+[[ $EUID == 0 && $(uname -s) == Linux ]] || fail 'run as a Linux administrator'
+for tool in ssh-keygen python3 flock install stat cmp mktemp; do
+    command -v "$tool" >/dev/null || fail "missing dependency: $tool"
+done
+for file in ops-access-root diagnose client.pub; do
+    [[ -f $bundle/$file && ! -L $bundle/$file ]] || fail "missing or unsafe bundle file: $file"
+done
+for dir in / /etc /run /usr; do
+    if [[ ! -d $dir ]] || ! protected "$dir"; then
+        fail "unsafe or missing directory: $dir"
+    fi
+done
+if exists "$lock"; then
+    if [[ ! -f $lock ]] || ! protected "$lock"; then
+        fail "unsafe install lock: $lock"
+    fi
+fi
+exec 9>>"$lock"
+flock -x 9
+
+dirs=(/usr/local /usr/local/bin /usr/local/libexec "$libexec" "$state")
+for dir in "${dirs[@]}"; do
+    if exists "$dir"; then
+        if [[ ! -d $dir ]] || ! protected "$dir"; then fail "unsafe directory: $dir"; fi
+    fi
+done
+for file in "$state/root-client.pub" "$issuer" "$libexec/diagnose"; do
+    if exists "$file"; then
+        if [[ ! -f $file ]] || ! protected "$file"; then fail "unsafe existing file: $file"; fi
+    fi
+done
+
+client=$(key_identity "$bundle/client.pub") || fail 'client.pub must contain one Ed25519 public key'
+if exists "$state/root-client.pub"; then
+    enrolled=$(key_identity "$state/root-client.pub") || fail 'invalid enrolled root client key'
+    [[ $client == "$enrolled" ]] || fail 'enrolled root client key differs'
+fi
+
+work=$(mktemp -d /run/.muchen-root-install.XXXXXXXX)
+staged=
+cleanup() {
+    if [[ -n $staged ]]; then rm -f -- "$staged"; fi
+    rm -f -- "$work/client.pub"
+    rmdir -- "$work"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+printf '%s\n' "$client" > "$work/client.pub"
+ssh-keygen -lf "$work/client.pub" >/dev/null || fail 'invalid Ed25519 public key'
+
+for dir in "${dirs[@]}"; do
+    [[ -d $dir ]] || mkdir -m 755 -- "$dir"
+done
+
+publish() {
+    local source=$1 dest=$2 mode=$3
+    if ! cmp -s -- "$source" "$dest" || [[ $(stat -c '%a:%g' -- "$dest") != "$mode:0" ]]; then
+        staged=$(mktemp "${dest%/*}/.muchen-root-install.XXXXXXXX")
+        install -m "$mode" -o root -g root -- "$source" "$staged"
+        mv -fT -- "$staged" "$dest"
+        staged=
+    fi
+    if command -v selinuxenabled >/dev/null && selinuxenabled; then
+        restorecon -- "$dest"
+    fi
+}
+
+publish "$bundle/diagnose" "$libexec/diagnose" 755
+publish "$work/client.pub" "$state/root-client.pub" 600
+publish "$bundle/ops-access-root" "$issuer" 755
+printf 'Installed root certificate tools. Run sudo ops-access-root to issue a certificate.\n'

@@ -1,6 +1,6 @@
 # 沐辰临时 SSH 诊断手册
 
-服务器安装一次后，你只需要运行 `sudo ops-access`，把标准输出中的一行 SSH 证书发给 Codex。用 `sudo ops-access 45m` 或 `sudo ops-access 2h` 可指定本次时长。Codex 使用本机保管的连接私钥访问已登记的目标，SSH 仅运行预设的诊断命令。
+普通诊断入口安装一次后，你只需要运行 `sudo ops-access`，把标准输出中的一行 SSH 证书发给 Codex。已有管理通道、明确需要以 root 身份运行固定诊断时，可选用本文的 [Root 只读证书](#root-只读证书)。用 `sudo ops-access 45m` 或 `sudo ops-access 2h` 可指定本次时长。Codex 使用本机保管的连接私钥访问已登记的目标，SSH 仅运行预设的诊断命令。
 
 ## 准备目标
 
@@ -64,6 +64,41 @@ python3 scripts/client.py diagnose app-test /path/to/ops-access-cert.pub
 
 证书和 SSH 目标主机的密钥是两种不同的凭据。服务器验证本次证书和连接私钥，本机验证登记过的主机指纹。证书的生效与到期使用服务器时钟，检查时间不符时先校准时间。
 
+## Root 只读证书
+
+这种方式需要现有管理员会话或控制台。安装器使用标准的 `/root/.ssh/authorized_keys`，要求有效 SSH 策略允许 root 通过公钥证书运行固定命令。若有效配置为 `PermitRootLogin no`，root 证书无法登录。安装使用现有的 root 账号，无需编辑或重新加载 sshd 配置。
+
+签发前，管理员需核对 Codex 实际连接来源和监听地址所适用的 SSH 策略。签发程序检查标准配置和当前管理员 SSH 会话的来源。若服务配置了 `Match`、自定义启动参数或非标准配置文件，还需核对证书可能匹配的实际连接。固定命令需要 `ForceCommand` 未配置或指向本工具的诊断程序，`PermitUserEnvironment` 和 `PermitTunnel` 关闭，`AcceptEnv` 最多允许 `LANG`、`LC_*`。
+
+先按本文的方法核验目标主机指纹，然后在 Codex 本机为同一服务器登记一个 root 模式专用别名。例如使用 `app-test-root`，已有的 `app-test` 仍用于普通诊断。
+
+```bash
+python3 scripts/client.py prepare app-test-root server.example.com --port 22
+python3 scripts/client.py bundle app-test-root ./root-bundle --root
+```
+
+通过现有管理通道把整个 `root-bundle` 传到目标机的管理员私有临时目录。包内包含 `install-root`、`ops-access-root`、`diagnose` 和本机连接公钥 `client.pub`。核对文件后，在目标机的管理员终端执行一次安装。
+
+```bash
+sudo /bin/bash /path/to/root-bundle/install-root
+```
+
+用 root 会话签发证书，或在管理员终端加 `sudo`。省略时长时有效期为 30 分钟，最长可签 2 小时。标准输出为一行 SSH 公钥证书，原样发给 Codex 即可。
+
+```bash
+ops-access-root 45m
+```
+
+每次签发使用一把独立的 CA 密钥，签发完成后删除 CA 私钥。新授权替换该工具此前的活动授权。要收回当前授权，在管理员终端运行 `sudo ops-access-root revoke`。撤销或到期后服务器拒绝新登录，已有会话需要由管理员单独结束。
+
+Codex 使用已登记的专用别名发起诊断。SSH 固定以 root 身份运行预设的只读命令，禁用交互终端、文件传输和端口转发。
+
+```bash
+python3 scripts/client.py diagnose app-test-root /path/to/root-cert.pub --root
+```
+
+管理员也可以设置下文的固定 TCP 探测列表。它用于确认诊断主机到批准端点的连接情况。登录这些端点所在的其他服务器要另外确认目标、账户和授权。若 Codex 所在机器无法直达目标，使用你的现有管理路径运行诊断并回传输出。
+
 ## 可选的 TCP 探测
 
 管理员可以在运行诊断的服务器上创建 `/etc/muchen-safe-ai-sh/tcp-probes`，逐行填写要探测的数字 IP 和 TCP 端口，以空白分隔。最多配置 8 项，每项连接超时 2 秒。配置由 root 管理，诊断账号只能读取。
@@ -95,6 +130,10 @@ sudo ops-access revoke 1
 把 `1` 替换为要撤销的序列号。服务器依据 OpenSSH 撤销列表拒绝该证书的新认证，正常到期也会阻止新连接。证书到期或撤销不会主动断开已建立的会话。需要立即终止时，由管理员结束对应的 `muchen-diag` 会话。
 
 ## 上线检查与回退
+
+Root 模式先通过现有管理入口运行 `sudo ops-access-root revoke`，核对工具签发的证书已不能建立新连接。继续保留管理员自己的 SSH 授权和会话。
+
+普通诊断模式按以下步骤检查与回退。
 
 1. 保留自己的管理会话，签发一张短时证书验证正常诊断。
 2. 核对证书只用于目标主机的 `muchen-diag` 账号，交互 Shell、SFTP 和端口转发均不可用。验证到期或撤销后，建立新连接会被拒绝。

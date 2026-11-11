@@ -87,8 +87,9 @@ def prepare(args):
     sys.stdout.write((directory / "client.pub").read_text(encoding="ascii"))
 
 
-def bundle_files(directory):
-    return [(SCRIPTS / name, name) for name in ("install-server", "ops-access", "diagnose")] + [
+def bundle_files(directory, root=False):
+    installer, signer = ("install-root", "ops-access-root") if root else ("install-server", "ops-access")
+    return [(SCRIPTS / name, name) for name in (installer, signer, "diagnose")] + [
         (directory / "client.pub", "client.pub")
     ]
 
@@ -97,7 +98,7 @@ def bundle(args):
     directory, _ = registration(args.alias)
     output = args.output.expanduser()
     output.mkdir(mode=0o700)
-    for source, name in bundle_files(directory):
+    for source, name in bundle_files(directory, root=args.root):
         shutil.copy2(source, output / name)
     print(output.resolve())
 
@@ -181,7 +182,8 @@ def diagnose(args):
             "-o", "PubkeyAcceptedAlgorithms=" + CERT_TYPE.decode("ascii"),
             "-i", str(identity),
         ]
-        subprocess.run(options + [f"{ACCOUNT}@{config['host']}"], check=True, timeout=30)
+        account = "root" if args.root else ACCOUNT
+        subprocess.run(options + [f"{account}@{config['host']}"], check=True, timeout=30)
 
 
 def positive(value):
@@ -201,6 +203,7 @@ def main():
     pack = modes.add_parser("bundle", help="Write a public-only installer bundle for manual transport.")
     pack.add_argument("alias")
     pack.add_argument("output", type=Path)
+    pack.add_argument("--root", action="store_true", help="Bundle for the existing root account.")
     pack.set_defaults(run=bundle)
     install = modes.add_parser("bootstrap", help="Install using a human-operated terminal.")
     install.add_argument("alias")
@@ -211,6 +214,7 @@ def main():
     check = modes.add_parser("diagnose", help="Run the registered host's fixed diagnostic.")
     check.add_argument("alias")
     check.add_argument("certificate", type=Path)
+    check.add_argument("--root", action="store_true", help="Use an explicitly issued root diagnostic certificate.")
     check.set_defaults(run=diagnose)
     args = parser.parse_args()
     try:

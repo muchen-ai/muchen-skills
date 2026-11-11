@@ -1,0 +1,197 @@
+#!/usr/bin/python3 -I
+"""Issue one temporary, fixed-command SSH certificate for the existing root account."""
+
+import fcntl
+import os
+from pathlib import Path
+import pwd
+import re
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+STATE = Path('/etc/muchen-safe-ai-sh')
+DIAGNOSE = Path('/usr/local/libexec/muchen-safe-ai-sh/diagnose')
+KEYGEN = '/usr/bin/ssh-keygen'
+SYSTEM_PATH = '/usr/sbin:/usr/bin:/sbin:/bin'
+MARKER = b' muchen-safe-ai-sh-root-v1'
+USAGE = 'Usage: ops-access-root [45m|2h] | ops-access-root revoke'
+
+
+def protected(path, file_type):
+    info = path.lstat()
+    if not file_type(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise ValueError('Unsafe root ownership or permissions: {}'.format(path))
+    return info
+
+
+def keygen(*args):
+    subprocess.run([KEYGEN, *map(str, args)], stdin=subprocess.DEVNULL,
+                   stdout=subprocess.DEVNULL, check=True,
+                   env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C', 'TZ': 'UTC0'})
+
+
+def lifetime(args):
+    if not args:
+        return 1800
+    match = re.fullmatch(r'([1-9][0-9]{0,2})(m|h)', args[0]) if len(args) == 1 else None
+    if not match:
+        raise ValueError(USAGE)
+    seconds = int(match[1]) * (60 if match[2] == 'm' else 3600)
+    if seconds > 7200:
+        raise ValueError('Maximum lifetime is 2h')
+    return seconds
+
+
+def restore_selinux_label(path):
+    enabled = shutil.which('selinuxenabled', path=SYSTEM_PATH)
+    if enabled and subprocess.run([enabled], check=False).returncode == 0:
+        restorecon = shutil.which('restorecon', path=SYSTEM_PATH)
+        if restorecon is None:
+            raise ValueError('restorecon is required with SELinux enabled')
+        subprocess.run([restorecon, str(path)], check=True, stdout=subprocess.DEVNULL)
+
+
+def check_ssh_policy(key_path):
+    # Check the standard config and the issuing SSH peer when one is available.
+    # An administrator must also review any other Match contexts that accept this key.
+    contexts = ['user=root,host=localhost,addr=127.0.0.1']
+    connection = os.environ.get('SSH_CONNECTION', '').split()
+    if len(connection) == 4 and all(re.fullmatch(r'[0-9A-Fa-f:.]+', field) for field in connection):
+        peer, _, local, port = connection
+        contexts.append('user=root,host={0},addr={0},laddr={1},lport={2}'.format(peer, local, port))
+    for context in contexts:
+        result = subprocess.run(['/usr/sbin/sshd', '-T', '-C', context], check=True,
+                                stdout=subprocess.PIPE, universal_newlines=True)
+        settings = {}
+        for line in result.stdout.splitlines():
+            option, _, value = line.partition(' ')
+            settings.setdefault(option, []).extend(value.split())
+        paths = settings.get('authorizedkeysfile', [])
+        if not set(paths).intersection(('.ssh/authorized_keys', '%h/.ssh/authorized_keys', str(key_path))):
+            raise ValueError('Effective root AuthorizedKeysFile does not read {}'.format(key_path))
+        if (settings.get('permitrootlogin') == ['no']
+                or settings.get('pubkeyauthentication') != ['yes']
+                or not set(settings.get('authenticationmethods', [])).intersection(('any', 'publickey'))):
+            raise ValueError('Effective SSH policy does not allow root public-key authentication')
+        if (settings.get('permituserenvironment') != ['no']
+                or settings.get('forcecommand') not in (['none'], [str(DIAGNOSE)])
+                or settings.get('permittunnel') != ['no']
+                or set(settings.get('acceptenv', [])) - {'LANG', 'LC_*'}):
+            raise ValueError('Effective root SSH environment or forced command is incompatible')
+
+
+def make_grant(seconds):
+    protected(DIAGNOSE.parent, stat.S_ISDIR)
+    protected(DIAGNOSE, stat.S_ISREG)
+    enrolled = STATE / 'root-client.pub'
+    protected(enrolled, stat.S_ISREG)
+    fields = enrolled.read_bytes().strip().split()
+    if len(fields) < 2 or fields[0] != b'ssh-ed25519':
+        raise ValueError('Expected an enrolled Ed25519 root client public key')
+    with tempfile.TemporaryDirectory(prefix='.root-grant-', dir=str(STATE)) as directory:
+        work = Path(directory)
+        client = work / 'client.pub'
+        client.write_bytes(b' '.join(fields[:2]) + b'\n')
+        ca = work / 'ca'
+        keygen('-q', '-t', 'ed25519', '-N', '', '-f', ca)
+        start = int(time.time())
+        validity = ':'.join(time.strftime('%Y%m%d%H%M%S', time.gmtime(epoch))
+                            for epoch in (start, start + seconds))
+        principal = 'muchen-root-' + secrets.token_hex(8)
+        keygen('-q', '-s', ca, '-I', principal, '-n', principal, '-z', '1',
+               '-V', validity, '-O', 'clear', '-O', 'force-command=' + str(DIAGNOSE), client)
+        ca.unlink()
+        certificate = (work / 'client-cert.pub').read_bytes().strip()
+        ca_key = b' '.join((work / 'ca.pub').read_bytes().split()[:2])
+    options = 'restrict,cert-authority,principals="{}",command="{}" '.format(principal, DIAGNOSE)
+    return options.encode('ascii') + ca_key + MARKER, certificate
+
+
+def file_version(path):
+    try:
+        info = protected(path, stat.S_ISREG)
+    except FileNotFoundError:
+        return None
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def set_grant(path, grant):
+    version = file_version(path)
+    before = path.read_bytes() if version else b''
+    lines = before.splitlines(keepends=True)
+    kept = [line for line in lines
+            if not (line.startswith(b'restrict,cert-authority,principals="muchen-root-')
+                    and line.rstrip(b'\r\n').endswith(MARKER))]
+    after = b''.join(kept)
+    if grant is not None:
+        if after and not after.endswith(b'\n'):
+            after += b'\n'
+        after += grant + b'\n'
+    if after == before:
+        return
+    with tempfile.NamedTemporaryFile(dir=str(path.parent), prefix='.muchen-root-', delete=False) as temporary:
+        staged = Path(temporary.name)
+        try:
+            temporary.write(after)
+            temporary.flush()
+            if version is not None:
+                shutil.copystat(path, staged)
+            else:
+                restore_selinux_label(staged)
+            os.fsync(temporary.fileno())
+            if file_version(path) != version:
+                raise ValueError('Root authorized_keys changed during issuance. Run the command again.')
+            os.replace(staged, path)
+        finally:
+            if staged.exists():
+                staged.unlink()
+
+
+def main(args):
+    if args in (['-h'], ['--help']):
+        print(USAGE)
+        return 0
+    if os.geteuid() != 0:
+        print('ops-access-root: run as root', file=sys.stderr)
+        return 1
+    os.umask(0o077)
+    try:
+        revoke = args == ['revoke']
+        seconds = None if revoke else lifetime(args)
+        protected(STATE, stat.S_ISDIR)
+        home = Path(pwd.getpwuid(0).pw_dir)
+        protected(home, stat.S_ISDIR)
+        ssh_directory = home / '.ssh'
+        lock = os.open(str(STATE / '.root-grant.lock'), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(lock, 'r+') as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            if revoke and not ssh_directory.exists() and not ssh_directory.is_symlink():
+                return 0
+            try:
+                ssh_directory.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            else:
+                restore_selinux_label(ssh_directory)
+            protected(ssh_directory, stat.S_ISDIR)
+            authorized_keys = ssh_directory / 'authorized_keys'
+            if revoke:
+                set_grant(authorized_keys, None)
+            else:
+                check_ssh_policy(authorized_keys)
+                trust, certificate = make_grant(seconds)
+                set_grant(authorized_keys, trust)
+                print(certificate.decode('ascii'))
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        print('ops-access-root: {}'.format(error), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
