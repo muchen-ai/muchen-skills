@@ -37,7 +37,7 @@ def keygen(*args):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         universal_newlines=True,
-        env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C', 'SSH_ASKPASS_REQUIRE': 'never'},
+        env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C', 'TZ': 'UTC0', 'SSH_ASKPASS_REQUIRE': 'never'},
     )
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or 'ssh-keygen failed')
@@ -101,9 +101,12 @@ def issue(value, work_dir, grants):
     expires = starts + lifetime
     if expires > MAX_SERIAL:
         raise ValueError('Certificate expiry is out of range')
+    # Older OpenSSH parses these digits in the subprocess timezone.
+    validity = ':'.join(time.strftime('%Y%m%d%H%M%S', time.gmtime(epoch))
+                        for epoch in (starts, expires))
     key_id = '{}-{}'.format(PRINCIPAL, serial)
     keygen('-q', '-s', ca, '-I', key_id, '-n', PRINCIPAL,
-           '-V', '{:#x}:{:#x}'.format(starts, expires), '-z', serial,
+           '-V', validity, '-z', serial,
            '-O', 'clear', '-O', 'force-command=' + FORCE_COMMAND, public_key)
     lines = (work_dir / 'client-cert.pub').read_text(encoding='ascii').splitlines()
     if len(lines) != 1 or '-cert-v01@openssh.com ' not in lines[0]:
