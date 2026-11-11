@@ -2,7 +2,7 @@
 
 [English](./README.md) | 中文
 
-面向 `muchen` 小程序模板平台的 Agent Skills 集合仓库。
+面向沐辰小程序开发和临时 SSH 诊断的 Agent Skills 仓库。
 
 ## 安装
 
@@ -48,6 +48,12 @@ Skill 目录：
 ```text
 ./skills/muchen-xiaochengxu-develop
 ```
+
+### muchen-safe-ai-sh
+
+为指定的 Linux 服务器初始化只读诊断账号。管理员从自己的终端完成首次安装，之后运行 `sudo ops-access` 或 `sudo ops-access 45m`，把输出的一行 SSH 证书交给 Codex 即可发起授权诊断。
+
+[Skill](./skills/muchen-safe-ai-sh/SKILL.md) · [安装与运维手册](./skills/muchen-safe-ai-sh/references/operator-guide.md)
 
 ## 验证
 

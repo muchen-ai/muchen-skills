@@ -1,0 +1,303 @@
+#!/bin/bash
+set -euo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+export LC_ALL=C
+umask 077
+
+state=/etc/muchen-safe-ai-sh
+home=/var/lib/muchen-safe-ai-sh
+libexec=/usr/local/libexec/muchen-safe-ai-sh
+config=/etc/ssh/sshd_config
+account=muchen-diag
+command_path=$libexec/diagnose
+include_line="Include $state/sshd.conf"
+bundle=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+default_seconds=
+max_seconds=
+
+fail() { printf 'muchen-safe-ai-sh: %s\n' "$*" >&2; exit 1; }
+
+while (( $# )); do
+    case "$1" in
+        --default-seconds|--max-seconds)
+            (( $# >= 2 )) && [[ $2 =~ ^[1-9][0-9]{0,8}$ ]] ||
+                fail "$1 needs a positive integer number of seconds"
+            if [[ $1 == --default-seconds ]]; then default_seconds=$2; else max_seconds=$2; fi
+            shift 2
+            ;;
+        *) fail "usage: install-server [--default-seconds N] [--max-seconds N]" ;;
+    esac
+done
+
+[[ $EUID == 0 && $(uname -s) == Linux ]] || fail "run as a Linux administrator"
+for tool in sshd ssh-keygen systemctl python3 useradd userdel getent timeout flock install stat; do
+    command -v "$tool" >/dev/null || fail "missing dependency: $tool"
+done
+for file in ops-access diagnose client.pub; do
+    [[ -f $bundle/$file && ! -L $bundle/$file ]] || fail "missing bundle file: $file"
+done
+
+exists() { [[ -e $1 || -L $1 ]]; }
+protected() {
+    [[ ! -L $1 && -O $1 ]] && (( (8#$(stat -c '%a' -- "$1") & 0022) == 0 ))
+}
+if [[ ! -f $config ]] || ! protected "$config"; then fail "expected a protected $config"; fi
+for dir in /etc /etc/ssh /run /var/lib /usr/local /usr/local/bin; do
+    if [[ ! -d $dir ]] || ! protected "$dir"; then fail "unsafe or missing directory: $dir"; fi
+done
+if exists /usr/local/libexec; then
+    if [[ ! -d /usr/local/libexec ]] || ! protected /usr/local/libexec; then fail "unsafe /usr/local/libexec"; fi
+fi
+
+exec 9>>/run/muchen-safe-ai-sh-install.lock
+flock -x 9
+
+service=
+for candidate in sshd.service ssh.service; do
+    if systemctl is-active --quiet "$candidate"; then service=$candidate; break; fi
+done
+[[ -n $service && $(systemctl show -p CanReload --value "$service") == yes ]] ||
+    fail "expected a running OpenSSH systemd service that supports reload"
+pid=$(systemctl show -p MainPID --value "$service")
+[[ $pid =~ ^[1-9][0-9]*$ && -r /proc/$pid/cmdline ]] || fail "cannot identify the running sshd"
+[[ $(readlink -f -- "/proc/$pid/exe") == "$(readlink -f -- "$(command -v sshd)")" ]] ||
+    fail "systemd service does not run the expected sshd executable"
+args="$(tr '\0' ' ' < "/proc/$pid/cmdline") $(systemctl show -p ExecStart --value "$service")"
+if [[ $args =~ [[:space:]]-[fo] ]]; then
+    fail "custom sshd config or command-line overrides require manual integration"
+fi
+sshd -t -f "$config"
+
+work=$(mktemp -d /etc/.muchen-safe-ai-sh.XXXXXXXX)
+changed=()
+created=()
+account_created=no
+config_published=no
+committed=no
+replace() {
+    local source=$1 dest=$2 mode=$3 metadata=${4:-} tmp
+    tmp=$(mktemp "${dest%/*}/.muchen-safe-ai-sh.XXXXXXXX") || return
+    if [[ -n $metadata ]]; then
+        if ! cp --preserve=all -- "$metadata" "$tmp" || ! cat -- "$source" > "$tmp"; then
+            rm -f -- "$tmp"
+            return 1
+        fi
+    elif ! install -m "$mode" -o root -g root -- "$source" "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if ! mv -fT -- "$tmp" "$dest"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if [[ -z $metadata ]] && command -v selinuxenabled >/dev/null && selinuxenabled; then
+        restorecon -- "$dest"
+    fi
+}
+save_and_replace() {
+    local source=$1 dest=$2 mode=$3 metadata=${4:-} index
+    if exists "$dest"; then
+        if [[ ! -f $dest ]] || ! protected "$dest"; then fail "unsafe existing file: $dest"; fi
+        if cmp -s -- "$source" "$dest" && [[ $(stat -c '%a' -- "$dest") == "$mode" ]]; then return; fi
+    fi
+    index=${#changed[@]}
+    if exists "$dest"; then cp --preserve=all -- "$dest" "$work/old.$index"; fi
+    changed+=("$dest")
+    replace "$source" "$dest" "$mode" "$metadata"
+}
+create_dir() {
+    mkdir -m "$1" -- "$2"
+    created+=("$2")
+}
+finish() {
+    local status=$? index path rollback_failed=no
+    if [[ $committed == no ]]; then
+        set +e
+        for (( index=${#changed[@]}-1; index>=0; index-- )); do
+            path=${changed[index]}
+            if [[ -f $work/old.$index ]]; then
+                replace "$work/old.$index" "$path" "$(stat -c '%a' -- "$work/old.$index")" "$work/old.$index" ||
+                    rollback_failed=yes
+            else
+                rm -f -- "$path" || rollback_failed=yes
+            fi
+        done
+        if [[ $config_published == yes ]]; then
+            sshd -t -f "$config" && systemctl reload "$service" || rollback_failed=yes
+        fi
+        if [[ $account_created == yes ]]; then userdel "$account" || rollback_failed=yes; fi
+        for (( index=${#created[@]}-1; index>=0; index-- )); do
+            rmdir -- "${created[index]}" || rollback_failed=yes
+        done
+        if [[ $rollback_failed == yes ]]; then
+            printf 'Rollback incomplete. Backups are in %s. Keep the administrator session open.\n' "$work" >&2
+            exit 1
+        fi
+    fi
+    rm -rf -- "$work"
+    exit "$status"
+}
+trap finish EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+read -r key_type key_data _ < "$bundle/client.pub" || fail "invalid client.pub"
+[[ $key_type == ssh-ed25519 && $key_data =~ ^[A-Za-z0-9+/]+=*$ ]] || fail "expected an Ed25519 client public key"
+printf '%s %s\n' "$key_type" "$key_data" > "$work/client.pub"
+ssh-keygen -lf "$work/client.pub" >/dev/null
+
+new=yes
+if exists "$state"; then
+    new=no
+    for dir in "$state" "$home" "$libexec"; do
+        if [[ ! -d $dir ]] || ! protected "$dir"; then fail "unsafe managed directory: $dir"; fi
+    done
+    for file in managed config.json ca ca.pub client.pub revoked.krl authorized_keys sshd.conf; do
+        if [[ ! -f $state/$file ]] || ! protected "$state/$file"; then
+            fail "incomplete or unsafe managed state: $file"
+        fi
+    done
+    [[ $(cat "$state/managed") == muchen-safe-ai-sh-v1 ]] || fail "unrecognized managed state"
+    [[ $(stat -c '%a' -- "$state/ca") == 600 ]] || fail "unsafe CA private key permissions"
+    cmp -s "$work/client.pub" "$state/client.pub" || fail "registered client key differs"
+    [[ $(head -n 1 "$config") == "$include_line" ]] || fail "managed SSH Include is missing or was moved"
+    IFS=: read -r name _ uid _ _ user_home login_shell < <(getent passwd "$account")
+    [[ $name == "$account" && $uid != 0 && $user_home == "$home" && $login_shell == /bin/sh &&
+        $(id -nG "$account") == "$account" ]] || fail "diagnostic account differs from the installed configuration"
+    [[ $(ssh-keygen -y -f "$state/ca" | awk '{ print $1, $2 }') == "$(awk '{ print $1, $2 }' "$state/ca.pub")" ]] ||
+        fail "CA public and private keys do not match"
+    ssh-keygen -Q -f "$state/revoked.krl" "$state/client.pub" >/dev/null ||
+        fail "cannot validate the revocation list"
+    stored=$(python3 -c '
+import json, sys
+with open(sys.argv[1]) as file:
+    config = json.load(file)
+print(config["default_seconds"], config["max_seconds"])
+' "$state/config.json")
+    read -r saved_default saved_max <<< "$stored"
+    default_seconds=${default_seconds:-$saved_default}
+    max_seconds=${max_seconds:-$saved_max}
+else
+    if getent passwd "$account" >/dev/null || getent group "$account" >/dev/null; then
+        fail "an unmanaged $account user or group already exists"
+    fi
+    for path in "$home" "$libexec" /usr/local/bin/ops-access; do
+        if exists "$path"; then fail "will not replace unmanaged path: $path"; fi
+    done
+    if grep -Fq -- "$state/sshd.conf" "$config"; then fail "unmanaged SSH Include already exists"; fi
+fi
+default_seconds=${default_seconds:-1800}
+max_seconds=${max_seconds:-28800}
+[[ $default_seconds =~ ^[1-9][0-9]{0,8}$ && $max_seconds =~ ^[1-9][0-9]{0,8}$ ]] ||
+    fail "invalid duration policy"
+(( default_seconds <= max_seconds )) || fail "default duration exceeds maximum"
+
+context='host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport=22'
+admin=${SUDO_USER:-root}
+[[ $admin =~ ^[A-Za-z0-9_.-]+$ && $admin != "$account" ]] || admin=root
+for identity in root "$admin"; do
+    sshd -T -f "$config" -C "user=$identity,$context" > "$work/before.$identity"
+done
+cp --preserve=all -- "$config" "$work/base-config"
+printf '{"default_seconds":%s,"max_seconds":%s}\n' "$default_seconds" "$max_seconds" > "$work/config.json"
+
+cat > "$work/sshd.conf" <<EOF_CONFIG
+Match User $account
+    AcceptEnv MUCHEN_UNUSED
+    AuthenticationMethods publickey
+    AuthorizedKeysFile $state/authorized_keys
+    AuthorizedKeysCommand none
+    AuthorizedPrincipalsFile none
+    AuthorizedPrincipalsCommand none
+    TrustedUserCAKeys none
+    RevokedKeys $state/revoked.krl
+    PubkeyAuthentication yes
+    PubkeyAcceptedAlgorithms ssh-ed25519-cert-v01@openssh.com
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    DisableForwarding yes
+    PermitTunnel no
+    PermitTTY no
+    PermitUserRC no
+    MaxSessions 1
+    ForceCommand $command_path
+EOF_CONFIG
+
+if [[ $new == yes ]]; then
+    create_dir 755 "$state"
+    create_dir 755 "$home"
+    [[ -d /usr/local/libexec ]] || create_dir 755 /usr/local/libexec
+    create_dir 755 "$libexec"
+    ssh-keygen -q -t ed25519 -N '' -C 'muchen-safe-ai-sh local CA' -f "$work/ca"
+    ssh-keygen -k -f "$work/revoked.krl" /dev/null >&2
+    for file in ca ca.pub client.pub revoked.krl; do
+        mode=644
+        if [[ $file == ca || $file == client.pub ]]; then mode=600; fi
+        save_and_replace "$work/$file" "$state/$file" "$mode"
+    done
+    useradd --system --no-create-home --home-dir "$home" --shell /bin/sh --user-group "$account"
+    account_created=yes
+fi
+
+ca_public=$(awk 'NR == 1 { print $1, $2 }' "$state/ca.pub")
+printf 'restrict,cert-authority,principals="%s",command="%s" %s\n' "$account" "$command_path" "$ca_public" > "$work/authorized_keys"
+
+save_and_replace "$bundle/ops-access" /usr/local/bin/ops-access 755
+save_and_replace "$bundle/diagnose" "$command_path" 755
+save_and_replace "$work/config.json" "$state/config.json" 600
+save_and_replace "$work/authorized_keys" "$state/authorized_keys" 644
+save_and_replace "$work/sshd.conf" "$state/sshd.conf" 644
+
+if [[ $new == yes ]]; then
+    { printf '%s\n' "$include_line"; cat "$work/base-config"; } > "$work/proposed-config"
+else
+    cp -p -- "$work/base-config" "$work/proposed-config"
+fi
+sshd -t -f "$work/proposed-config"
+sshd -T -f "$work/proposed-config" -C "user=$account,$context" > "$work/diagnostic-settings"
+for expected in \
+    'usepam yes' \
+    'authenticationmethods publickey' \
+    "authorizedkeysfile $state/authorized_keys" \
+    'authorizedkeyscommand none' \
+    'trustedusercakeys none' \
+    "revokedkeys $state/revoked.krl" \
+    'pubkeyauthentication yes' \
+    'pubkeyacceptedalgorithms ssh-ed25519-cert-v01@openssh.com' \
+    'passwordauthentication no' \
+    'kbdinteractiveauthentication no' \
+    'disableforwarding yes' \
+    'permittty no' \
+    'permittunnel no' \
+    'permituserrc no' \
+    'permituserenvironment no' \
+    'chrootdirectory none' \
+    'maxsessions 1' \
+    "forcecommand $command_path"; do
+    grep -Fxq -- "$expected" "$work/diagnostic-settings" || fail "effective SSH configuration is missing: $expected"
+done
+[[ $(grep '^acceptenv ' "$work/diagnostic-settings") == "acceptenv MUCHEN_UNUSED" ]] ||
+    fail "effective SSH settings accept unexpected client environment variables"
+for identity in root "$admin"; do
+    sshd -T -f "$work/proposed-config" -C "user=$identity,$context" > "$work/after.$identity"
+    cmp -s "$work/before.$identity" "$work/after.$identity" || fail "effective SSH settings changed for $identity"
+done
+
+if [[ $new == yes ]]; then
+    cmp -s "$work/base-config" "$config" || fail "$config changed during installation"
+    config_published=yes
+    save_and_replace "$work/proposed-config" "$config" "$(stat -c '%a' -- "$config")" "$work/base-config"
+    printf 'muchen-safe-ai-sh-v1\n' > "$work/managed"
+    save_and_replace "$work/managed" "$state/managed" 600
+fi
+if [[ $config_published == yes ]] || (( ${#changed[@]} > 0 )); then
+    sshd -t -f "$config"
+    config_published=yes
+    systemctl reload "$service"
+    systemctl is-active --quiet "$service"
+fi
+committed=yes
+printf 'Installed ops-access. Account: %s. Default: %ss. Maximum: %ss.\n' "$account" "$default_seconds" "$max_seconds" >&2
+ssh-keygen -lf "$state/ca.pub" >&2

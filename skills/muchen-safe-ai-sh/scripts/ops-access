@@ -1,0 +1,186 @@
+#!/usr/bin/python3
+"""Issue and revoke diagnostic SSH certificates as the server administrator."""
+
+import fcntl
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+STATE_DIR = Path('/etc/muchen-safe-ai-sh')
+SSH_KEYGEN = '/usr/bin/ssh-keygen'
+PRINCIPAL = 'muchen-diag'
+FORCE_COMMAND = '/usr/local/libexec/muchen-safe-ai-sh/diagnose'
+MAX_SERIAL = (1 << 64) - 1
+USAGE = 'Usage: ops-access [45m|2h] | ops-access revoke <serial>'
+
+
+def trusted_file(path, private=False):
+    details = path.lstat()
+    forbidden_mode = 0o077 if private else 0o022
+    if (not stat.S_ISREG(details.st_mode) or details.st_uid != os.geteuid()
+            or details.st_mode & forbidden_mode):
+        raise ValueError('Unsafe ownership or permissions: {}'.format(path))
+    return path
+
+
+def keygen(*args):
+    result = subprocess.run(
+        [SSH_KEYGEN, *map(str, args)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C', 'SSH_ASKPASS_REQUIRE': 'never'},
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or 'ssh-keygen failed')
+
+
+def configured_lifetime(value):
+    config = json.loads(trusted_file(STATE_DIR / 'config.json').read_text())
+    if not isinstance(config, dict):
+        raise ValueError('Invalid lifetime configuration')
+    default, maximum = config.get('default_seconds'), config.get('max_seconds')
+    if (type(default) is not int or type(maximum) is not int
+            or not 0 < default <= maximum):
+        raise ValueError('Configure positive default_seconds and max_seconds with default <= max')
+    if value is None:
+        return default
+    match = re.fullmatch(r'([1-9][0-9]{0,8})(m|h)', value)
+    if not match:
+        raise ValueError('Specify a positive duration in minutes or hours, such as 45m or 2h')
+    duration = int(match[1]) * (60 if match[2] == 'm' else 3600)
+    if duration > maximum:
+        raise ValueError('Requested lifetime exceeds the configured maximum of {} seconds'.format(maximum))
+    return duration
+
+
+def read_grants():
+    try:
+        grants = json.loads(trusted_file(STATE_DIR / 'grants.json', private=True).read_text())
+    except FileNotFoundError:
+        return {}
+    if (not isinstance(grants, dict)
+            or any(not re.fullmatch(r'[1-9][0-9]{0,19}', serial)
+                   or int(serial) > MAX_SERIAL or not isinstance(record, dict)
+                   for serial, record in grants.items())):
+        raise ValueError('Invalid grant records')
+    return grants
+
+
+def save_grants(work_dir, grants):
+    staged = work_dir / 'grants.json'
+    with staged.open('x') as out:
+        json.dump(grants, out, indent=2)
+        out.write('\n')
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(staged, STATE_DIR / 'grants.json')
+
+
+def issue(value, work_dir, grants):
+    lifetime = configured_lifetime(value)
+    serial = max((int(previous) for previous in grants), default=0) + 1
+    if serial > MAX_SERIAL:
+        raise ValueError('Certificate serial numbers exhausted')
+    ca = trusted_file(STATE_DIR / 'ca', private=True)
+    enrolled = trusted_file(STATE_DIR / 'client.pub').read_text(encoding='ascii').splitlines()
+    fields = enrolled[0].split() if len(enrolled) == 1 else []
+    if len(fields) < 2 or fields[0] != 'ssh-ed25519':
+        raise ValueError('client.pub must contain exactly one Ed25519 public key')
+    public_key = work_dir / 'client.pub'
+    public_key.write_text(' '.join(fields[:2]) + '\n', encoding='ascii')
+    starts = int(time.time())
+    expires = starts + lifetime
+    if expires > MAX_SERIAL:
+        raise ValueError('Certificate expiry is out of range')
+    key_id = '{}-{}'.format(PRINCIPAL, serial)
+    keygen('-q', '-s', ca, '-I', key_id, '-n', PRINCIPAL,
+           '-V', '{:#x}:{:#x}'.format(starts, expires), '-z', serial,
+           '-O', 'clear', '-O', 'force-command=' + FORCE_COMMAND, public_key)
+    lines = (work_dir / 'client-cert.pub').read_text(encoding='ascii').splitlines()
+    if len(lines) != 1 or '-cert-v01@openssh.com ' not in lines[0]:
+        raise RuntimeError('Unexpected certificate output')
+    grants[str(serial)] = {
+        'key_id': key_id,
+        'issued_at': starts,
+        'expires_at': expires,
+        'issued_by': os.environ.get('SUDO_USER') or 'root',
+    }
+    save_grants(work_dir, grants)
+    return lines[0]
+
+
+def revoke(serial, work_dir, grants):
+    if serial not in grants:
+        raise ValueError('Unknown grant serial: {}'.format(serial))
+    ca_public = trusted_file(STATE_DIR / 'ca.pub')
+    krl = STATE_DIR / 'revoked.krl'
+    staged = work_dir / 'revoked.krl'
+    spec = work_dir / 'revoke.txt'
+    spec.write_text('serial: {}\n'.format(serial), encoding='ascii')
+    flags = ['-k']
+    if krl.exists() or krl.is_symlink():
+        shutil.copyfile(trusted_file(krl), staged)
+        flags.append('-u')
+    keygen(*flags, '-f', staged, '-s', ca_public, spec)
+    staged.chmod(0o644)
+    with staged.open('rb') as file:
+        os.fsync(file.fileno())
+    os.replace(staged, krl)
+    grants[serial].setdefault('revoked_at', int(time.time()))
+    grants[serial].setdefault('revoked_by', os.environ.get('SUDO_USER') or 'root')
+    save_grants(work_dir, grants)
+
+
+def execute(args):
+    if len(args) == 2 and args[0] == 'revoke' and re.fullmatch(r'[1-9][0-9]{0,19}', args[1]):
+        serial = args[1]
+    elif len(args) <= 1 and (not args or re.fullmatch(r'[1-9][0-9]{0,8}[mh]', args[0])):
+        serial = None
+    else:
+        raise ValueError(USAGE)
+    directory = STATE_DIR.lstat()
+    if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.geteuid()
+            or directory.st_mode & 0o022):
+        raise ValueError('Unsafe ownership or permissions: {}'.format(STATE_DIR))
+    lock_fd = os.open(str(STATE_DIR / '.lock'), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(lock_fd, 'r+') as lock:
+        trusted_file(STATE_DIR / '.lock', private=True)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        grants = read_grants()
+        with tempfile.TemporaryDirectory(prefix='.ops-access-', dir=str(STATE_DIR)) as work:
+            work_dir = Path(work)
+            if serial is None:
+                return issue(args[0] if args else None, work_dir, grants)
+            revoke(serial, work_dir, grants)
+    return None
+
+
+def main(args):
+    if args in (['-h'], ['--help']):
+        print(USAGE)
+        return 0
+    if os.geteuid() != 0:
+        print('ops-access: run as an administrator via sudo', file=sys.stderr)
+        return 1
+    os.umask(0o077)
+    try:
+        certificate = execute(args)
+        if certificate is not None:
+            print(certificate)
+    except (OSError, ValueError, RuntimeError) as error:
+        print('ops-access: {}'.format(error), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

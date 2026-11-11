@@ -5,17 +5,18 @@
     "email": ""
   },
   "metadata": {
-    "description": "Skills for developing muchen mini program full-stack projects",
+    "description": "Skills for muchen mini program development and temporary SSH diagnostics",
     "version": "0.1.0"
   },
   "plugins": [
     {
       "name": "muchen-skills",
-      "description": "muchen mini program template initialization, full-stack development, Docker verification, and cleanup workflows",
+      "description": "muchen mini program development and temporary read-only SSH diagnostics",
       "source": "./",
       "strict": false,
       "skills": [
-        "./skills/muchen-xiaochengxu-develop"
+        "./skills/muchen-xiaochengxu-develop",
+        "./skills/muchen-safe-ai-sh"
       ]
     }
   ]
