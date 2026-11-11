@@ -87,19 +87,54 @@ def prepare(args):
     sys.stdout.write((directory / "client.pub").read_text(encoding="ascii"))
 
 
-def bundle_files(directory, root=False):
-    installer, signer = ("install-root", "ops-access-root") if root else ("install-server", "ops-access")
-    return [(SCRIPTS / name, name) for name in (installer, signer, "diagnose")] + [
-        (directory / "client.pub", "client.pub")
-    ]
+def bundle_files(directory, root=False, fleet=False):
+    if fleet:
+        names = ("install-fleet-jump", "fleet-relay", "fleet-trust", "ops-access-fleet",
+                 "ops-access-clear", "ops-access")
+    else:
+        installer, signer = ("install-root", "ops-access-root") if root else ("install-server", "ops-access")
+        names = (installer, signer, "diagnose")
+    return [(SCRIPTS / name, name) for name in names] + [(directory / "client.pub", "client.pub")]
+
+
+def read_fleet_targets(path):
+    if path is None:
+        return b""
+    with path.open("rb") as stream:
+        content = stream.read(8193)
+    if len(content) > 8192:
+        raise ValueError("fleet-targets exceeds 8192 bytes.")
+    entries = 0
+    for number, line in enumerate(content.decode("ascii").split("\n"), 1):
+        if not line:
+            continue
+        entries += 1
+        if entries > 256:
+            raise ValueError("fleet-targets exceeds 256 entries.")
+        address, _, port = line.partition(" ")
+        try:
+            if not re.fullmatch(r"[1-9][0-9]{0,4}", port):
+                raise ValueError
+            verify_fleet_endpoint(address, int(port))
+        except ValueError:
+            raise ValueError(f"Invalid fleet target on line {number}.") from None
+    return content
 
 
 def bundle(args):
+    if args.targets is not None and not args.fleet:
+        raise ValueError("--targets requires --fleet.")
     directory, _ = registration(args.alias)
+    targets = read_fleet_targets(args.targets) if args.fleet else None
+    files = bundle_files(directory, root=args.root, fleet=args.fleet)
     output = args.output.expanduser()
     output.mkdir(mode=0o700)
-    for source, name in bundle_files(directory, root=args.root):
+    for source, name in files:
         shutil.copy2(source, output / name)
+    if targets is not None:
+        inventory = output / "fleet-targets"
+        inventory.write_bytes(targets)
+        inventory.chmod(0o600)
     print(output.resolve())
 
 
@@ -154,9 +189,8 @@ printf '%s' '{payload}' | base64 -d | tar --no-same-owner -xzf - -C "$work"
     ]
     subprocess.run(options + [target, request], check=True)
 
-def diagnose(args):
-    directory, config = registration(args.alias)
-    with args.certificate.open("rb") as stream:
+def read_certificate(path):
+    with path.open("rb") as stream:
         data = stream.read(16385)
     line = data.strip()
     fields = line.split(None, 2)
@@ -167,23 +201,81 @@ def diagnose(args):
     except binascii.Error:
         raise ValueError("Malformed SSH public certificate.") from None
 
+    return line
+
+
+def stage_identity(directory, work, certificate):
+    # The sibling certificate pairs with the private key even when ordinary public keys are disabled.
+    identity = work / "client"
+    identity.symlink_to(directory / "client")
+    cert = work / "client-cert.pub"
+    cert.write_bytes(certificate + b"\n")
+    cert.chmod(0o600)
+    return identity
+
+
+def certificate_options(identity):
+    return [
+        "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
+        "-o", "ControlMaster=no", "-o", "ControlPath=none",
+        "-o", "PreferredAuthentications=publickey",
+        "-o", "PubkeyAcceptedAlgorithms=" + CERT_TYPE.decode("ascii"),
+        "-i", str(identity),
+    ]
+
+
+def diagnose(args):
+    directory, config = registration(args.alias)
+    line = read_certificate(args.certificate)
     with tempfile.TemporaryDirectory(prefix="msha-cert-") as work:
-        # OpenSSH associates a sibling certificate with its IdentityFile even when
-        # cert-only algorithm filtering removes the ordinary public-key identity.
-        identity = Path(work) / "client"
-        identity.symlink_to(directory / "client")
-        cert = Path(work) / "client-cert.pub"
-        cert.write_bytes(line + b"\n")
-        cert.chmod(0o600)
-        options = ssh_options(config) + [
-            "-T", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
-            "-o", "ControlMaster=no", "-o", "ControlPath=none",
-            "-o", "PreferredAuthentications=publickey",
-            "-o", "PubkeyAcceptedAlgorithms=" + CERT_TYPE.decode("ascii"),
-            "-i", str(identity),
-        ]
+        identity = stage_identity(directory, Path(work), line)
+        options = ssh_options(config) + ["-T"] + certificate_options(identity)
         account = "root" if args.root else ACCOUNT
         subprocess.run(options + [f"{account}@{config['host']}"], check=True, timeout=30)
+
+
+def fleet_host_keys(directory, work):
+    source = directory / "fleet-known-hosts"
+    try:
+        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return []
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise ValueError(f"Expected a protected, user-owned regular file: {source}")
+        destination = work / source.name
+        with destination.open("wb") as copy:
+            shutil.copyfileobj(stream, copy)
+        destination.chmod(0o600)
+    return ["-o", f"UserKnownHostsFile={destination}", "-o", "GlobalKnownHostsFile=none"]
+
+
+def verify_fleet_endpoint(address, port):
+    if str(ipaddress.IPv4Address(address)) != address or not 1 <= port <= 65535:
+        raise ValueError("Use a canonical IPv4 address and an SSH port between 1 and 65535.")
+
+
+def fleet_connect(args):
+    verify_fleet_endpoint(args.ipv4, args.port)
+    directory, config = registration(args.alias)
+    line = read_certificate(args.certificate)
+    # OpenSSH expands tokens in option paths. Stage these at a literal, private path.
+    with tempfile.TemporaryDirectory(prefix="msha-fleet-", dir="/tmp") as temporary:
+        work = Path(temporary)
+        identity = stage_identity(directory, work, line)
+        credentials = certificate_options(identity)
+        jump = ssh_options(config) + ["-T", "-e", "none"] + credentials + [
+            "--", f"root@{config['host']}", f"muchen-fleet-connect {args.ipv4} {args.port}",
+        ]
+        # ProxyCommand is expanded by OpenSSH before it reaches the local shell.
+        proxy = shlex.join(jump).replace("%", "%%")
+        target = ssh_options({"port": args.port}) + credentials + fleet_host_keys(directory, work) + [
+            "-o", f"ProxyCommand={proxy}", "--", f"root@{args.ipv4}",
+        ]
+        if args.remote_command is not None:
+            target.append(args.remote_command)
+        return subprocess.run(target).returncode
 
 
 def positive(value):
@@ -203,7 +295,10 @@ def main():
     pack = modes.add_parser("bundle", help="Write a public-only installer bundle for manual transport.")
     pack.add_argument("alias")
     pack.add_argument("output", type=Path)
-    pack.add_argument("--root", action="store_true", help="Bundle for the existing root account.")
+    pack_modes = pack.add_mutually_exclusive_group()
+    pack_modes.add_argument("--root", action="store_true", help="Bundle for the existing root account.")
+    pack_modes.add_argument("--fleet", action="store_true", help="Bundle the fleet bastion installer.")
+    pack.add_argument("--targets", type=Path, help="Approved fleet endpoints, one IPv4 and port per line.")
     pack.set_defaults(run=bundle)
     install = modes.add_parser("bootstrap", help="Install using a human-operated terminal.")
     install.add_argument("alias")
@@ -216,9 +311,16 @@ def main():
     check.add_argument("certificate", type=Path)
     check.add_argument("--root", action="store_true", help="Use an explicitly issued root diagnostic certificate.")
     check.set_defaults(run=diagnose)
+    fleet = modes.add_parser("fleet-connect", help="Connect to an approved SSH host through a registered bastion.")
+    fleet.add_argument("alias", metavar="bastion-alias")
+    fleet.add_argument("certificate", type=Path, metavar="certificate-file")
+    fleet.add_argument("ipv4", metavar="IPv4")
+    fleet.add_argument("--port", type=positive, default=22)
+    fleet.add_argument("--command", dest="remote_command", help="Run a single remote command on the target.")
+    fleet.set_defaults(run=fleet_connect)
     args = parser.parse_args()
     try:
-        args.run(args)
+        return args.run(args) or 0
     except subprocess.CalledProcessError as error:
         print(f"muchen-safe-ai-sh: {args.command} failed (exit {error.returncode}). See the output above.", file=sys.stderr)
         return 1
@@ -228,7 +330,6 @@ def main():
     except (OSError, ValueError, KeyError) as error:
         print(f"muchen-safe-ai-sh: {error}", file=sys.stderr)
         return 1
-    return 0
 
 
 if __name__ == "__main__":

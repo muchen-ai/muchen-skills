@@ -26,6 +26,14 @@ description: Set up temporary SSH certificate access on an explicitly designated
 2. 用户在服务器运行 `ops-access-root 45m` 并发来证书后，用本 Skill 的绝对路径运行 `python3 scripts/client.py diagnose <alias> <certificate-file> --root`。使用同样的目标核验和证书文件处理流程。有效 SSH 策略拒绝 root 公钥登录时停止，由用户选择其他管理路径。
 3. 证书只允许以 root 身份运行固定诊断。管理员配置的 TCP 探测可以验证诊断主机到已批准端点的连接情况。登录其中任何另一台主机均需单独确认目标、账户和授权。
 
+## 多台服务器的临时证书
+
+用户明确授权后，使用已有的管理员通道批量配置目标机信任同一个机群 CA。用独立别名登记跳板机，按[机群证书流程](references/operator-guide.md#机群证书)准备安装包、管理目标白名单，并验证目标主机指纹。首次接入先用小批量验证，既有管理账号和认证设置由各主机保留。
+
+日常由管理员在跳板机运行 `ops-access-fleet 45m`，将输出的一行证书交给 Codex。使用该证书、明确指定的目标和独立跳板别名运行 `python3 scripts/client.py fleet-connect <bastion-alias> <certificate-file> <target-ip>`。跳板只代理登记的 IP 和端口，目标机独立验证同一张证书。目标机的 root 会话具有该账户的权限，执行内容以用户当次授权为准。
+
+`ops-access-clear` 清除安装主机的普通诊断证书，机群证书授权仍有效。管理员使用 `ops-access-fleet revoke` 收回当前证书在跳板上的新连接权限。完成使用后删除临时证书文件。
+
 若目标管理员配置了 [TCP 探测](references/operator-guide.md#可选的-tcp-探测)，按诊断主机到指定 IP 和端口的连接结果解读 `tcp_probe`。SSH 端口可达只说明 TCP 连接成功，SSH 认证要单独验证。
 
 管理员凭据通常在用户自己的终端输入。需要另做一次管理员登录对照时，先确认用户明确指定了目标、账户并授权该次登录；该动作与证书诊断分开，凭据不得写入文件、脚本或 Git。初始化、撤销和回退详见[安装与运维手册](references/operator-guide.md)。

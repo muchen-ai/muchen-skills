@@ -141,3 +141,46 @@ Root 模式先通过现有管理入口运行 `sudo ops-access-root revoke`，核
 4. 需要回退时，保持自己的管理会话开启，清空 `/etc/muchen-safe-ai-sh/authorized_keys` 以收回专用 CA 信任。结束该账号的诊断会话，再删除专用的 `muchen-diag` 账号。备份并编辑 `/etc/ssh/sshd_config`，只移除安装器加入的 `Include /etc/muchen-safe-ai-sh/sshd.conf`。通过 `sshd -t` 后重新加载对应的 `ssh.service` 或 `sshd.service`，再验证管理员仍能新建连接。最后可归档签发记录并移除专用状态目录、诊断脚本和 `/usr/local/bin/ops-access`。
 
 [OpenSSH 证书签发与 KRL](https://man.openbsd.org/ssh-keygen.1) · [OpenSSH 主机密钥校验](https://man.openbsd.org/ssh_config.5#StrictHostKeyChecking) · [OpenSSH 授权密钥选项](https://man.openbsd.org/sshd.8#AUTHORIZED_KEYS_FILE_FORMAT)
+
+## 机群证书
+
+机群 CA 的私钥只保存在跳板机的 root 目录权限下。将同一份 CA 公钥配置到目标机现有的 root 账号后，一张短期证书可以用于整份已接入的清单。跳板使用固定代理程序，允许连接管理员登记的 IPv4 和 TCP 端口。每台目标机只接受从登记跳板源 IP 到达的机群证书。目标机需要允许现有 root 通过公钥登录，登录后拥有该账号的权限。
+
+先用已经核验的跳板主机指纹登记一个专用别名。在 Codex 本机生成只含公开文件的安装包。
+
+```bash
+python3 scripts/client.py prepare fleet-bastion bastion.example.com --port 2224
+python3 scripts/client.py bundle fleet-bastion ./fleet-bootstrap --fleet
+```
+
+通过现有管理通道把安装包传到跳板机，然后以 root 执行一次安装。安装会生成或复用机群 CA，保持现有 sshd 配置。初始转发表为空。
+
+```bash
+bash /path/to/fleet-bootstrap/install-fleet-jump
+```
+
+通过已有的管理通道，用 Ansible 等批量工具把 `fleet-trust` 和 `fleet-ca.pub` 复制到目标机 root 的私有临时目录，再由 root 执行以下命令。将示例 IP 替换为目标机实际看到的跳板源 IP。目标机授权条目保存在现有 `.ssh/authorized_keys`，同一个 CA 可以重复安装。
+
+```bash
+/usr/bin/python3 -I /path/to/fleet-trust target 10.2.0.138 /path/to/fleet-ca.pub
+```
+
+将已接入主机登记到跳板机的 `/etc/muchen-safe-ai-sh/fleet-targets`，每行是规范 IPv4、一个空格和端口，例如 `10.2.0.198 22`。用 root 所有的受保护文件原子替换清单，确保清单与已接入主机一致。Codex 本机需要核验跳板和各目标机的 SSH 主机公钥。可以将已核验的目标主机记录放在专用别名目录下的 `fleet-known-hosts`。安装完成后，先选少量主机验证同一张证书能通过跳板并登录目标，再扩大清单。
+
+平时在跳板机运行以下命令。默认有效期 30 分钟，最大 2 小时。每次签发会替换跳板上先前的活动机群授权。把输出的一行证书发给 Codex。
+
+```bash
+ops-access-fleet 45m
+```
+
+Codex 用专用别名以及核验过的目标连接。省略 `--command` 时打开目标机 SSH 会话。
+
+```bash
+python3 scripts/client.py fleet-connect fleet-bastion /path/to/fleet-cert.pub 10.2.0.198 --command 'id -u'
+```
+
+在安装主机运行 `ops-access-clear` 会清除该主机的普通 root 诊断授权，并批量撤销旧诊断账号的已签发证书。机群证书仍可用。单独运行 `ops-access-fleet revoke` 会关闭当前机群证书从该跳板新建代理连接的权限。证书到期或撤销不会主动断开已经建立的会话。目标机如果要撤销整个机群 CA 的信任，用相同管理通道批量执行以下命令。
+
+```bash
+/usr/bin/python3 -I /path/to/fleet-trust remove-target /path/to/fleet-ca.pub
+```

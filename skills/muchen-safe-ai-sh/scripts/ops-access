@@ -18,7 +18,7 @@ SSH_KEYGEN = '/usr/bin/ssh-keygen'
 PRINCIPAL = 'muchen-diag'
 FORCE_COMMAND = '/usr/local/libexec/muchen-safe-ai-sh/diagnose'
 MAX_SERIAL = (1 << 64) - 1
-USAGE = 'Usage: ops-access [45m|2h] | ops-access revoke <serial>'
+USAGE = 'Usage: ops-access [45m|2h] | ops-access revoke <serial> | ops-access revoke-all'
 
 
 def trusted_file(path, private=False):
@@ -121,14 +121,17 @@ def issue(value, work_dir, grants):
     return lines[0]
 
 
-def revoke(serial, work_dir, grants):
-    if serial not in grants:
-        raise ValueError('Unknown grant serial: {}'.format(serial))
+def revoke(serials, work_dir, grants):
+    if not serials:
+        return
+    for serial in serials:
+        if serial not in grants:
+            raise ValueError('Unknown grant serial: {}'.format(serial))
     ca_public = trusted_file(STATE_DIR / 'ca.pub')
     krl = STATE_DIR / 'revoked.krl'
     staged = work_dir / 'revoked.krl'
     spec = work_dir / 'revoke.txt'
-    spec.write_text('serial: {}\n'.format(serial), encoding='ascii')
+    spec.write_text(''.join('serial: {}\n'.format(serial) for serial in serials), encoding='ascii')
     flags = ['-k']
     if krl.exists() or krl.is_symlink():
         shutil.copyfile(trusted_file(krl), staged)
@@ -138,13 +141,19 @@ def revoke(serial, work_dir, grants):
     with staged.open('rb') as file:
         os.fsync(file.fileno())
     os.replace(staged, krl)
-    grants[serial].setdefault('revoked_at', int(time.time()))
-    grants[serial].setdefault('revoked_by', os.environ.get('SUDO_USER') or 'root')
+    revoked_at = int(time.time())
+    revoked_by = os.environ.get('SUDO_USER') or 'root'
+    for serial in serials:
+        grants[serial].setdefault('revoked_at', revoked_at)
+        grants[serial].setdefault('revoked_by', revoked_by)
     save_grants(work_dir, grants)
 
 
 def execute(args):
-    if len(args) == 2 and args[0] == 'revoke' and re.fullmatch(r'[1-9][0-9]{0,19}', args[1]):
+    revoke_all = args == ['revoke-all']
+    if revoke_all:
+        serial = None
+    elif len(args) == 2 and args[0] == 'revoke' and re.fullmatch(r'[1-9][0-9]{0,19}', args[1]):
         serial = args[1]
     elif len(args) <= 1 and (not args or re.fullmatch(r'[1-9][0-9]{0,8}[mh]', args[0])):
         serial = None
@@ -161,9 +170,12 @@ def execute(args):
         grants = read_grants()
         with tempfile.TemporaryDirectory(prefix='.ops-access-', dir=str(STATE_DIR)) as work:
             work_dir = Path(work)
-            if serial is None:
+            if revoke_all:
+                revoke(grants.keys(), work_dir, grants)
+            elif serial is None:
                 return issue(args[0] if args else None, work_dir, grants)
-            revoke(serial, work_dir, grants)
+            else:
+                revoke((serial,), work_dir, grants)
     return None
 
 

@@ -1,0 +1,165 @@
+#!/bin/bash
+set -euo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH LC_ALL=C SSH_ASKPASS_REQUIRE=never
+umask 077
+
+state=/etc/muchen-safe-ai-sh
+bin=/usr/local/bin
+libexec=/usr/local/libexec/muchen-safe-ai-sh
+lock=/run/muchen-safe-ai-sh-install.lock
+bundle=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+
+fail() { printf 'install-fleet-jump: %s\n' "$*" >&2; exit 1; }
+exists() { [[ -e $1 || -L $1 ]]; }
+protected() {
+    local permissions
+    [[ ! -L $1 && -O $1 ]] || return 1
+    permissions=$(stat -c '%a' -- "$1") || return 1
+    (( (8#$permissions & 0022) == 0 ))
+}
+safe_file() {
+    if [[ ! -f $1 ]] || ! protected "$1"; then fail "unsafe file: $1"; fi
+}
+key_identity() {
+    local line extra type material
+    IFS= read -r line || [[ -n $line ]] || return 1
+    if IFS= read -r extra || [[ -n $extra ]]; then return 1; fi
+    read -r type material _ <<< "$line"
+    [[ $type == ssh-ed25519 && $material =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || return 1
+    printf '%s %s\n' "$type" "$material"
+}
+
+(( $# == 0 )) || fail 'usage: sudo ./install-fleet-jump'
+[[ $EUID == 0 && $(uname -s) == Linux ]] || fail 'run as a Linux administrator'
+for tool in ssh-keygen python3 flock install stat cmp mktemp; do
+    command -v "$tool" >/dev/null || fail "missing dependency: $tool"
+done
+for file in fleet-relay fleet-trust ops-access-fleet ops-access-clear ops-access client.pub fleet-targets; do
+    [[ -f $bundle/$file && ! -L $bundle/$file ]] || fail "missing or unsafe bundle file: $file"
+done
+for dir in / /etc /run /usr; do
+    if [[ ! -d $dir ]] || ! protected "$dir"; then fail "unsafe or missing directory: $dir"; fi
+done
+if exists "$lock"; then safe_file "$lock"; fi
+exec 9>>"$lock"
+flock -x 9
+
+dirs=(/usr/local "$bin" /usr/local/libexec "$libexec" "$state")
+for dir in "${dirs[@]}"; do
+    if exists "$dir"; then
+        if [[ ! -d $dir ]] || ! protected "$dir"; then fail "unsafe directory: $dir"; fi
+    fi
+done
+programs=("$libexec/fleet-relay" "$libexec/fleet-trust" "$bin/ops-access-fleet" "$bin/ops-access-clear")
+if exists "$state/managed"; then
+    safe_file "$state/managed"
+    [[ $(cat -- "$state/managed") == muchen-safe-ai-sh-v1 ]] || fail 'unrecognized legacy diagnostic state'
+    programs+=("$bin/ops-access")
+fi
+for path in "${programs[@]}"; do
+    if exists "$path"; then safe_file "$path"; fi
+done
+
+fleet_files=("$state/fleet-ca" "$state/fleet-ca.pub" "$state/fleet-client.pub" "$state/fleet-targets")
+present=0
+for path in "${fleet_files[@]}"; do
+    if exists "$path"; then
+        safe_file "$path"
+        present=$((present + 1))
+    fi
+done
+if (( present == 0 )); then
+    if exists "$state/fleet-grants.json" || exists "$bin/ops-access-fleet"; then
+        fail 'existing fleet installation is missing its state'
+    fi
+elif (( present != ${#fleet_files[@]} )); then
+    fail 'incomplete fleet state; restore all fleet state files before retrying'
+fi
+
+work=$(mktemp -d "${lock%/*}/.muchen-fleet-install.XXXXXXXX")
+staged=
+creating_state=0
+cleanup() {
+    if [[ -n $staged ]]; then rm -f -- "$staged"; fi
+    if (( creating_state )); then rm -f -- "${fleet_files[@]}"; fi
+    rm -rf -- "$work"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+client=$(key_identity < "$bundle/client.pub") || fail 'client.pub must contain one Ed25519 public key'
+printf '%s\n' "$client" > "$work/fleet-client.pub"
+ssh-keygen -lf "$work/fleet-client.pub" >/dev/null || fail 'invalid Ed25519 public key'
+python3 -I - "$bundle/fleet-targets" "$work/fleet-targets" <<'PY'
+from ipaddress import IPv4Address
+from pathlib import Path
+import sys
+
+with open(sys.argv[1], 'rb') as source:
+    content = source.read(8193)
+lines = content.split(b'\n')
+if lines[-1] == b'':
+    lines.pop()
+if len(content) > 8192 or len(lines) > 256:
+    sys.exit('install-fleet-jump: fleet-targets exceeds 8192 bytes or 256 targets')
+for number, line in enumerate(lines, 1):
+    try:
+        address, port = line.decode('ascii').split(' ')
+        if port != '22' or str(IPv4Address(address)) != address:
+            raise ValueError
+    except ValueError:
+        sys.exit(f'install-fleet-jump: expected an IPv4 address and port 22 on fleet-targets line {number}')
+Path(sys.argv[2]).write_bytes(content)
+PY
+
+if (( present )); then
+    [[ $(stat -c '%a' -- "$state/fleet-ca") == 600 ]] || fail 'fleet-ca must have mode 0600'
+    ca_public=$(key_identity < "$state/fleet-ca.pub") || fail 'invalid fleet CA public key'
+    ca_private=$(ssh-keygen -y -P '' -f "$state/fleet-ca" </dev/null | key_identity) || fail 'invalid fleet CA private key'
+    [[ $ca_private == "$ca_public" ]] || fail 'fleet-ca and fleet-ca.pub do not match'
+    enrolled=$(key_identity < "$state/fleet-client.pub") || fail 'invalid enrolled fleet client key'
+    [[ $client == "$enrolled" ]] || fail 'enrolled fleet client key differs'
+    if [[ -s $state/fleet-targets ]] && ! cmp -s -- "$work/fleet-targets" "$state/fleet-targets"; then
+        fail 'fleet-targets is already populated and differs from the bundle; review the existing allowlist on the jump host'
+    fi
+else
+    ssh-keygen -q -t ed25519 -N '' -C 'muchen-safe-ai-sh fleet CA' -f "$work/fleet-ca" </dev/null
+fi
+
+selinux=0
+if command -v selinuxenabled >/dev/null && selinuxenabled; then
+    command -v restorecon >/dev/null || fail 'restorecon is required with SELinux enabled'
+    selinux=1
+fi
+for dir in "${dirs[@]}"; do
+    [[ -d $dir ]] || mkdir -m 755 -- "$dir"
+done
+
+publish() {
+    local source=$1 dest=$2 mode=$3
+    if ! cmp -s -- "$source" "$dest" || [[ $(stat -c '%a:%g' -- "$dest") != "$mode:0" ]]; then
+        staged=$(mktemp "${dest%/*}/.muchen-fleet-install.XXXXXXXX")
+        install -m "$mode" -o root -g root -- "$source" "$staged"
+        mv -fT -- "$staged" "$dest"
+        staged=
+    fi
+    if (( selinux )); then restorecon -- "$dest"; fi
+}
+
+if (( present == 0 )); then
+    creating_state=1
+    publish "$work/fleet-ca" "$state/fleet-ca" 600
+    publish "$work/fleet-ca.pub" "$state/fleet-ca.pub" 644
+    publish "$work/fleet-client.pub" "$state/fleet-client.pub" 600
+    publish "$work/fleet-targets" "$state/fleet-targets" 600
+    creating_state=0
+elif [[ ! -s $state/fleet-targets && -s $work/fleet-targets ]]; then
+    publish "$work/fleet-targets" "$state/fleet-targets" 600
+fi
+for path in "${programs[@]}"; do
+    publish "$bundle/${path##*/}" "$path" 755
+done
+printf 'Installed fleet jump tools. Public CA: %s\n' "$state/fleet-ca.pub"

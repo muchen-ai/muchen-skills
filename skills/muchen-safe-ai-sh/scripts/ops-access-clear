@@ -1,0 +1,41 @@
+#!/bin/sh
+# Clear diagnostic certificates using their installed issuers.
+
+usage='Usage: ops-access-clear'
+case "$#:${1-}" in
+    0:) ;;
+    1:-h|1:--help) printf '%s\n' "$usage"; exit 0 ;;
+    *) printf '%s\n' "$usage" >&2; exit 1 ;;
+esac
+if [ "$(/usr/bin/id -u)" != 0 ]; then
+    printf '%s\n' 'ops-access-clear: run as root' >&2
+    exit 1
+fi
+
+root_issuer=/usr/local/bin/ops-access-root
+legacy_issuer=/usr/local/bin/ops-access
+state=/etc/muchen-safe-ai-sh
+found=0
+status=0
+if [ -e "$root_issuer" ] || [ -L "$root_issuer" ] || [ -e "$state/root-client.pub" ]; then
+    found=1
+    if ! "$root_issuer" revoke; then
+        printf '%s\n' 'ops-access-clear: root diagnostic revocation failed' >&2
+        status=1
+    fi
+fi
+if [ -e "$legacy_issuer" ] || [ -L "$legacy_issuer" ] || [ -e "$state/managed" ]; then
+    found=1
+    if ! "$legacy_issuer" revoke-all; then
+        printf '%s\n' 'ops-access-clear: legacy diagnostic revocation failed' >&2
+        status=1
+    fi
+fi
+if [ "$found" -eq 0 ]; then
+    printf '%s\n' 'ops-access-clear: no diagnostic issuer found' >&2
+    exit 1
+fi
+if [ "$status" -eq 0 ]; then
+    printf '%s\n' 'Cleared temporary diagnostic SSH certificate grants.'
+fi
+exit "$status"

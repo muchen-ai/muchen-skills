@@ -1,0 +1,201 @@
+#!/usr/bin/python3 -I
+"""Install or remove a scoped SSH CA entry for the existing root account."""
+
+import fcntl
+import ipaddress
+import os
+from pathlib import Path
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+STATE = Path('/etc/muchen-safe-ai-sh')
+RELAY = '/usr/local/libexec/muchen-safe-ai-sh/fleet-relay'
+SYSTEM_PATH = '/usr/sbin:/usr/bin:/sbin:/bin'
+LOCALE_ENV = frozenset({
+    'LANG', 'LANGUAGE', 'LC_*', 'LC_ALL', 'LC_ADDRESS', 'LC_COLLATE',
+    'LC_CTYPE', 'LC_IDENTIFICATION', 'LC_MEASUREMENT', 'LC_MESSAGES',
+    'LC_MONETARY', 'LC_NAME', 'LC_NUMERIC', 'LC_PAPER', 'LC_TELEPHONE',
+    'LC_TIME', 'XMODIFIERS',
+})
+JUMP_MARKER = b' muchen-safe-ai-sh-fleet-jump-v1'
+TARGET_MARKER = b' muchen-safe-ai-sh-fleet-target-v1'
+USAGE = 'Usage: fleet-trust target <jump IPv4> <CA.pub> | remove-target <CA.pub> | jump <serial> | revoke-jump'
+
+
+def protected(path, file_type):
+    info = path.lstat()
+    if not file_type(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise ValueError('Unsafe root ownership or permissions: {}'.format(path))
+    return info
+
+
+def key_material(path):
+    protected(path, stat.S_ISREG)
+    data = path.read_bytes().strip().split()
+    if len(data) < 2 or data[0] != b'ssh-ed25519' or not re.fullmatch(b'[A-Za-z0-9+/]+={0,2}', data[1]):
+        raise ValueError('Expected an Ed25519 CA public key')
+    subprocess.run(['/usr/bin/ssh-keygen', '-lf', str(path)], check=True, stdout=subprocess.DEVNULL)
+    return b' '.join(data[:2])
+
+
+def restore_label(path):
+    enabled = shutil.which('selinuxenabled', path=SYSTEM_PATH)
+    if enabled and subprocess.run([enabled], check=False).returncode == 0:
+        restorecon = shutil.which('restorecon', path=SYSTEM_PATH)
+        if not restorecon:
+            raise ValueError('restorecon is required with SELinux enabled')
+        subprocess.run([restorecon, str(path)], check=True, stdout=subprocess.DEVNULL)
+
+
+def check_policy(key_path, jump, source=None):
+    context = 'user=root,host=localhost,addr=127.0.0.1'
+    connection = os.environ.get('SSH_CONNECTION', '').split()
+    if len(connection) == 4:
+        peer, _, local, port = connection
+        peer = str(ipaddress.ip_address(peer))
+        local = str(ipaddress.ip_address(local))
+        context = 'user=root,host={0},addr={0},laddr={1},lport={2}'.format(peer, local, int(port))
+        if source and peer != source:
+            raise ValueError('This target sees a different SSH source than {}'.format(source))
+    output = subprocess.check_output(['/usr/sbin/sshd', '-T', '-C', context], universal_newlines=True)
+    settings = {}
+    for line in output.splitlines():
+        option, _, value = line.partition(' ')
+        settings.setdefault(option, []).extend(value.split())
+    paths = {'.ssh/authorized_keys', '%h/.ssh/authorized_keys', str(key_path)}
+    if not paths.intersection(settings.get('authorizedkeysfile', [])):
+        raise ValueError('Effective root AuthorizedKeysFile differs')
+    root_modes = {'yes', 'prohibit-password', 'without-password'}
+    if jump:
+        root_modes.add('forced-commands-only')
+    if (not root_modes.intersection(settings.get('permitrootlogin', []))
+            or settings.get('pubkeyauthentication') != ['yes']
+            or not {'any', 'publickey'}.intersection(settings.get('authenticationmethods', []))
+            or settings.get('forcecommand') != ['none']):
+        raise ValueError('Effective root SSH policy is incompatible')
+    if jump and (settings.get('permituserenvironment') != ['no']
+                 or settings.get('permittunnel') != ['no']
+                 or set(settings.get('acceptenv', [])) - LOCALE_ENV):
+        raise ValueError('Effective jump SSH environment is incompatible')
+
+
+def file_info(path):
+    try:
+        return protected(path, stat.S_ISREG)
+    except FileNotFoundError:
+        return None
+
+
+def version(info):
+    if info is None:
+        return None
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def update_keys(path, marker, ca_key, grant):
+    info = file_info(path)
+    before = path.read_bytes() if info else b''
+    kept = []
+    for line in before.splitlines(keepends=True):
+        if line.rstrip(b'\r\n').endswith(marker):
+            if b' ' + ca_key + marker != line.rstrip(b'\r\n')[-(len(ca_key) + len(marker) + 1):]:
+                raise ValueError('Existing managed SSH authorization uses another CA')
+        else:
+            kept.append(line)
+    after = b''.join(kept)
+    if grant is not None:
+        if after and not after.endswith(b'\n'):
+            after += b'\n'
+        after += grant + b' ' + ca_key + marker + b'\n'
+    if before == after:
+        return
+    with tempfile.NamedTemporaryFile(dir=str(path.parent), prefix='.muchen-fleet-', delete=False) as temporary:
+        staged = Path(temporary.name)
+        try:
+            temporary.write(after)
+            temporary.flush()
+            if info:
+                os.chown(staged, 0, info.st_gid)
+                shutil.copystat(path, staged)
+            else:
+                restore_label(staged)
+            os.fsync(temporary.fileno())
+            if version(file_info(path)) != version(info):
+                raise ValueError('Root authorized_keys changed during update. Retry.')
+            os.replace(staged, path)
+        finally:
+            if staged.exists():
+                staged.unlink()
+
+
+def execute(args):
+    mode = args[0] if args else ''
+    source = None
+    grant = None
+    jump = mode in ('jump', 'revoke-jump')
+    if jump:
+        protected(STATE, stat.S_ISDIR)
+        ca_path = STATE / 'fleet-ca.pub'
+        marker = JUMP_MARKER
+        lock_path = STATE / '.root-grant.lock'
+        if mode == 'jump' and len(args) == 2 and re.fullmatch(r'[1-9][0-9]{0,19}', args[1]):
+            protected(Path(RELAY).parent, stat.S_ISDIR)
+            protected(Path(RELAY), stat.S_ISREG)
+            grant = ('restrict,cert-authority,principals="muchen-fleet-jump-{}",'
+                     'command="exec {}"').format(args[1], RELAY).encode('ascii')
+        elif args != ['revoke-jump']:
+            raise ValueError(USAGE)
+    else:
+        marker = TARGET_MARKER
+        lock_path = Path('/run/muchen-fleet-authorized-keys.lock')
+        if mode == 'target' and len(args) == 3:
+            source = str(ipaddress.IPv4Address(args[1]))
+            ca_path = Path(args[2])
+            grant = ('restrict,pty,cert-authority,principals="muchen-fleet-root",from="{}"'
+                     .format(source)).encode('ascii')
+        elif mode == 'remove-target' and len(args) == 2:
+            ca_path = Path(args[1])
+        else:
+            raise ValueError(USAGE)
+    ca_key = key_material(ca_path)
+    home = Path(pwd.getpwuid(0).pw_dir)
+    protected(home, stat.S_ISDIR)
+    ssh_directory = home / '.ssh'
+    lock = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(lock, 'r+') as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        if grant is None and not ssh_directory.exists() and not ssh_directory.is_symlink():
+            return
+        try:
+            ssh_directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        else:
+            restore_label(ssh_directory)
+        protected(ssh_directory, stat.S_ISDIR)
+        key_path = ssh_directory / 'authorized_keys'
+        if grant is not None:
+            check_policy(key_path, jump, source)
+        update_keys(key_path, marker, ca_key, grant)
+
+
+def main():
+    if os.geteuid() != 0:
+        print('fleet-trust: run as root', file=sys.stderr)
+        return 1
+    os.umask(0o077)
+    try:
+        execute(sys.argv[1:])
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        print('fleet-trust: {}'.format(error), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
