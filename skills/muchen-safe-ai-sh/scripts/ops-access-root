@@ -18,6 +18,12 @@ STATE = Path('/etc/muchen-safe-ai-sh')
 DIAGNOSE = Path('/usr/local/libexec/muchen-safe-ai-sh/diagnose')
 KEYGEN = '/usr/bin/ssh-keygen'
 SYSTEM_PATH = '/usr/sbin:/usr/bin:/sbin:/bin'
+LOCALE_ENV = frozenset({
+    'LANG', 'LANGUAGE', 'LC_*', 'LC_ALL', 'LC_ADDRESS', 'LC_COLLATE',
+    'LC_CTYPE', 'LC_IDENTIFICATION', 'LC_MEASUREMENT', 'LC_MESSAGES',
+    'LC_MONETARY', 'LC_NAME', 'LC_NUMERIC', 'LC_PAPER', 'LC_TELEPHONE',
+    'LC_TIME', 'XMODIFIERS',
+})
 MARKER = b' muchen-safe-ai-sh-root-v1'
 USAGE = 'Usage: ops-access-root [45m|2h] | ops-access-root revoke'
 
@@ -81,7 +87,7 @@ def check_ssh_policy(key_path):
         if (settings.get('permituserenvironment') != ['no']
                 or settings.get('forcecommand') not in (['none'], [str(DIAGNOSE)])
                 or settings.get('permittunnel') != ['no']
-                or set(settings.get('acceptenv', [])) - {'LANG', 'LC_*'}):
+                or set(settings.get('acceptenv', [])) - LOCALE_ENV):
             raise ValueError('Effective root SSH environment or forced command is incompatible')
 
 

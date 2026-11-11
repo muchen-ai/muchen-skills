@@ -68,7 +68,7 @@ python3 scripts/client.py diagnose app-test /path/to/ops-access-cert.pub
 
 这种方式需要现有管理员会话或控制台。安装器使用标准的 `/root/.ssh/authorized_keys`，要求有效 SSH 策略允许 root 通过公钥证书运行固定命令。若有效配置为 `PermitRootLogin no`，root 证书无法登录。安装使用现有的 root 账号，无需编辑或重新加载 sshd 配置。
 
-签发前，管理员需核对 Codex 实际连接来源和监听地址所适用的 SSH 策略。签发程序检查标准配置和当前管理员 SSH 会话的来源。若服务配置了 `Match`、自定义启动参数或非标准配置文件，还需核对证书可能匹配的实际连接。固定命令需要 `ForceCommand` 未配置或指向本工具的诊断程序，`PermitUserEnvironment` 和 `PermitTunnel` 关闭，`AcceptEnv` 最多允许 `LANG`、`LC_*`。
+签发前，管理员需核对 Codex 实际连接来源和监听地址所适用的 SSH 策略。签发程序检查标准配置和当前管理员 SSH 会话的来源。若服务配置了 `Match`、自定义启动参数或非标准配置文件，还需核对证书可能匹配的实际连接。固定命令需要 `ForceCommand` 未配置或指向本工具的诊断程序，`PermitUserEnvironment` 和 `PermitTunnel` 关闭，`AcceptEnv` 仅接受 `LANG`、`LANGUAGE`、`LC_*`、常见的逐项 `LC_` 变量及 `XMODIFIERS`。
 
 先按本文的方法核验目标主机指纹，然后在 Codex 本机为同一服务器登记一个 root 模式专用别名。例如使用 `app-test-root`，已有的 `app-test` 仍用于普通诊断。
 
