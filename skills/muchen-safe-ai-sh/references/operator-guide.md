@@ -64,6 +64,26 @@ python3 scripts/client.py diagnose app-test /path/to/ops-access-cert.pub
 
 证书和 SSH 目标主机的密钥是两种不同的凭据。服务器验证本次证书和连接私钥，本机验证登记过的主机指纹。证书的生效与到期使用服务器时钟，检查时间不符时先校准时间。
 
+## 可选的 TCP 探测
+
+管理员可以在运行诊断的服务器上创建 `/etc/muchen-safe-ai-sh/tcp-probes`，逐行填写要探测的数字 IP 和 TCP 端口，以空白分隔。最多配置 8 项，每项连接超时 2 秒。配置由 root 管理，诊断账号只能读取。
+
+```text
+10.2.0.198 22
+10.2.0.201 22
+```
+
+用 `sudoedit /etc/muchen-safe-ai-sh/tcp-probes` 编辑，然后确认文件归属和权限。
+
+```bash
+sudo chown root:root /etc/muchen-safe-ai-sh/tcp-probes
+sudo chmod 0644 /etc/muchen-safe-ai-sh/tcp-probes
+```
+
+诊断输出会追加形如 `tcp_probe=10.2.0.198:22 reachable` 的记录。结果来自运行诊断的服务器，`reachable` 表示 TCP 连接建立，`unreachable` 表示本次连接未建立。即使探测的是 SSH 端口，仍需另行验证 SSH 认证。临时证书仍只执行固定诊断命令，保持禁用转发。如需对照一次管理员登录，由用户单独指定目标和账户并授权，凭据不写入脚本或配置。
+
+如需停用探测，先把配置移到管理员的私有备份目录，或确认不再需要后删除 `/etc/muchen-safe-ai-sh/tcp-probes`。文件不存在时，下次诊断只输出原有的主机状态。修改或停用探测均无需重新加载 SSH。
+
 ## 审计和撤销
 
 每张证书有唯一序列号。管理员可查阅 `/etc/muchen-safe-ai-sh/grants.json` 中的签发与撤销记录，并与 SSH 认证日志比对。若持有证书文件，也可使用 `ssh-keygen -Lf /path/to/ops-access-cert.pub` 查看序列号和有效期。

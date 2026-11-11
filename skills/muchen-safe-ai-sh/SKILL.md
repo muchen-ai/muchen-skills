@@ -20,4 +20,6 @@ description: Set up temporary SSH certificate access on an explicitly designated
 3. 用本 Skill 的绝对路径运行 `python3 scripts/client.py diagnose <alias> <certificate-file>`。连接使用该别名登记的主机指纹、连接私钥和本次证书。完成后清理临时证书并总结结果。
 4. 遇到证书过期、拒绝或已撤销时，报告原因，由管理员决定是否重新签发。主机指纹不匹配时停止，按[手册](references/operator-guide.md)重新核验。始终由管理员操作签发和撤销。
 
-管理员凭据只在用户自己的终端输入。Git 仓库只保存脚本和文档。初始化、受限能力、撤销和回退详见[安装与运维手册](references/operator-guide.md)。
+若目标管理员配置了 [TCP 探测](references/operator-guide.md#可选的-tcp-探测)，按诊断主机到指定 IP 和端口的连接结果解读 `tcp_probe`。SSH 端口可达只说明 TCP 连接成功，SSH 认证要单独验证。
+
+管理员凭据通常在用户自己的终端输入。需要另做一次管理员登录对照时，先确认用户明确指定了目标、账户并授权该次登录；该动作与证书诊断分开，凭据不得写入文件、脚本或 Git。初始化、撤销和回退详见[安装与运维手册](references/operator-guide.md)。
